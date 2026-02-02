@@ -1,81 +1,96 @@
 import streamlit as st
 import docx
 import re
+import zipfile
+import io
 
-# 1. Page Configuration
-st.set_page_config(page_title="Ad & Creative Matcher", layout="wide")
+# 1. Expand limits and set layout
+st.set_page_config(page_title="Ad Matcher High-Speed", layout="wide")
 
-def extract_data_from_docx(file):
+# 2. Cache the Word Document extraction
+@st.cache_data
+def get_ad_data(file):
     doc = docx.Document(file)
-    content = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
-    full_text = "\n".join(content)
-    # Finds 8-digit numbers (Ad Codes)
-    ad_codes = sorted(list(set(re.findall(r'\b\d{8}\b', full_text))))
-    return ad_codes, full_text
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    codes = sorted(list(set(re.findall(r'\b\d{8}\b', text))))
+    return codes, text
 
-def main():
-    st.title("🎯 Ad-Creative Matcher")
+# 3. Cache the Assets in memory so they don't reload on every click
+@st.cache_resource
+def load_assets(uploaded_files):
+    processed_assets = []
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name.lower().endswith('.zip'):
+            with zipfile.ZipFile(uploaded_file) as z:
+                for file_info in z.infolist():
+                    if file_info.is_dir() or "__MACOSX" in file_info.filename:
+                        continue
+                    # Read into memory
+                    with z.open(file_info) as f:
+                        data = f.read()
+                        processed_assets.append({
+                            "name": file_info.filename,
+                            "data": data,
+                            "ext": file_info.filename.split('.')[-1].lower()
+                        })
+        else:
+            # Handle individual files
+            processed_assets.append({
+                "name": uploaded_file.name,
+                "data": uploaded_file.getvalue(),
+                "ext": uploaded_file.name.split('.')[-1].lower()
+            })
+    return processed_assets
 
-    with st.sidebar:
-        st.header("Step 1: Upload Files")
-        word_file = st.file_uploader("Upload Ad Details (Word Doc)", type=['docx'])
-        
-        st.header("Step 2: Upload Assets")
-        # Added 'mp3' and 'wav' to the type list
-        creatives = st.file_uploader(
-            "Upload Images/Videos/Audio", 
-            accept_multiple_files=True,
-            type=['png', 'jpg', 'jpeg', 'gif', 'mp4', 'mov', 'webm', 'mp3', 'wav']
-        )
-        
-    if word_file and creatives:
-        ad_codes, full_doc_text = extract_data_from_docx(word_file)
-        
-        search_query = st.text_input("🔍 Search by Ad Code", placeholder="e.g. 48725915")
-        display_codes = [c for c in ad_codes if search_query in c] if search_query else ad_codes
+st.title("⚡ Ultra-Fast Ad Matcher")
 
-        for code in display_codes:
-            matched_files = [f for f in creatives if code in f.name]
-            
-            with st.expander(f"📦 Ad Code: {code} ({len(matched_files)} files found)", expanded=True):
-                col1, col2 = st.columns([1, 1.5])
+# Sidebar Uploads
+with st.sidebar:
+    st.header("Upload")
+    word_file = st.file_uploader("Upload Word Doc", type=['docx'])
+    raw_files = st.file_uploader("Upload Assets or ZIP", accept_multiple_files=True)
+    if st.button("Clear Cache / Reset"):
+        st.cache_resource.clear()
+        st.rerun()
+
+if word_file and raw_files:
+    # This runs once and stays in memory
+    all_assets = load_assets(raw_files)
+    ad_codes, full_text = get_ad_data(word_file)
+
+    st.success(f"Loaded {len(all_assets)} files. Found {len(ad_codes)} Ad Codes.")
+    
+    # Fast Search
+    search = st.text_input("🔍 Quick Search Ad Code", placeholder="Type to filter...")
+    filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
+
+    for code in filtered_codes:
+        # Match based on filename containing the code
+        matches = [a for a in all_assets if code in a['name']]
+        
+        if matches:
+            with st.expander(f"✅ Ad {code} - {len(matches)} files found", expanded=True):
+                c1, c2 = st.columns([1, 1.5])
                 
-                with col1:
-                    st.markdown("**Ad Details:**")
+                with c1:
+                    st.markdown("**Ad Specs:**")
                     pattern = f"{code}.*?(?=\\n\\n|Ad Code:|$)"
-                    match_text = re.search(pattern, full_doc_text, re.DOTALL)
-                    if match_text:
-                        st.code(match_text.group(0), language=None)
+                    found = re.search(pattern, full_text, re.DOTALL)
+                    st.code(found.group(0) if found else f"Ad Code: {code}", language=None)
                 
-                with col2:
-                    if matched_files:
-                        for asset in matched_files:
-                            ext = asset.name.split('.')[-1].lower()
-                            st.markdown(f"📄 `{asset.name}`")
-                            
-                            # --- AUDIO SUPPORT ---
-                            if ext in ['mp3', 'wav']:
-                                st.audio(asset)
-                            
-                            # --- VIDEO SUPPORT ---
-                            elif ext in ['mp4', 'mov', 'webm']:
-                                st.video(asset)
-                            
-                            # --- IMAGE SUPPORT ---
-                            elif ext in ['jpg', 'jpeg', 'png', 'gif']:
-                                st.image(asset, use_container_width=True)
-                            
-                            st.download_button(
-                                label=f"Download {asset.name}",
-                                data=asset,
-                                file_name=asset.name,
-                                key=f"dl_{asset.name}_{code}"
-                            )
-                            st.divider()
-                    else:
-                        st.error("No creative file found matching this Ad Code.")
-    else:
-        st.info("Waiting for Word Doc and Creative Assets...")
+                with c2:
+                    for asset in matches:
+                        st.caption(f"File: {asset['name']}")
+                        # Media logic
+                        if asset['ext'] in ['mp4', 'mov', 'webm']:
+                            st.video(asset['data'])
+                        elif asset['ext'] in ['mp3', 'wav']:
+                            st.audio(asset['data'])
+                        elif asset['ext'] in ['jpg', 'jpeg', 'png', 'gif']:
+                            st.image(asset['data'])
+                        
+                        st.download_button("Download", data=asset['data'], file_name=asset['name'], key=f"dl_{asset['name']}_{code}")
+                        st.divider()
 
-if __name__ == "__main__":
-    main()
+else:
+    st.info("Please upload your Word doc and creative assets to begin.")
