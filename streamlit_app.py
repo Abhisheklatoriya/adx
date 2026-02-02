@@ -5,7 +5,7 @@ import zipfile
 import io
 
 # 1. Expand limits and set layout
-st.set_page_config(page_title="Ad Matcher High-Speed", layout="wide")
+st.set_page_config(page_title="Ad creative matcher", layout="wide")
 
 # 2. Cache the Word Document extraction
 @st.cache_data
