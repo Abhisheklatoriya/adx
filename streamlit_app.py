@@ -17,10 +17,6 @@ st.title("⚡ Ad Matcher (Excel + Live Processing + Disk Storage)")
 # Excel loader
 # -------------------------------
 @st.cache_data
-import pandas as pd
-import streamlit as st
-
-@st.cache_data
 def load_excel(file):
     # 1) Read raw (no header) so we can find the real header row
     raw = pd.read_excel(file, header=None, engine="openpyxl")
@@ -62,7 +58,11 @@ def load_excel(file):
     df[ad_code_col] = df[ad_code_col].astype(str).str.strip()
     df = df[df[ad_code_col].str.match(r"^\d{8}$")]
 
-    return df, ad_code_col
+    # 7) Extract ad codes list and set
+    ad_codes = df[ad_code_col].tolist()
+    ad_codes_set = set(ad_codes)
+
+    return df, ad_code_col, ad_codes, ad_codes_set
 
 
 # -------------------------------
