@@ -4,76 +4,109 @@ import re
 import zipfile
 import io
 
-# 1. Expand limits and set layout
 st.set_page_config(page_title="Ad creative matcher", layout="wide")
 st.title("⚡ Ultra-Fast Ad Matcher (XLSX)")
 
 AD_CODE_RE = re.compile(r"\b\d{8}\b")
 
 
-def _digits_only(x: str) -> str:
-    return re.sub(r"\D", "", str(x or ""))
+def normalize_ad_code(value) -> str | None:
+    """
+    Returns an 8-digit ad code string if found, else None.
+    Handles:
+      - 48725703
+      - 48725703.0
+      - "Ad Code: 48725703"
+      - "48,725,703"
+    """
+    s = "" if value is None else str(value).strip()
+
+    m = AD_CODE_RE.search(s)
+    if m:
+        return m.group(0)
+
+    digits = re.sub(r"\D", "", s)
+
+    # Excel float case: "48725703.0" => digits "487257030"
+    if len(digits) == 9 and digits.endswith("0") and len(digits[:-1]) == 8:
+        return digits[:-1]
+
+    if len(digits) == 8:
+        return digits
+
+    if len(digits) > 8:
+        # If extra digits exist, usually first 8 is the ad code in these sheets
+        return digits[:8]
+
+    return None
 
 
-# 2. Cache the Excel extraction (auto-detect header row + find Ad Codes)
+def extract_ad_code_from_filename(filename: str) -> str | None:
+    """
+    Extract an 8-digit ad code from filenames like:
+      asset_ad_48734339_WAUOgJ.mp4
+
+    Strategy:
+      1) Prefer an explicit 8-digit match anywhere in filename.
+      2) Fallback: take the first 8 digits from any longer digit run.
+    """
+    if not filename:
+        return None
+
+    m = AD_CODE_RE.search(filename)
+    if m:
+        return m.group(0)
+
+    # fallback: any long digit run
+    runs = re.findall(r"\d{8,}", filename)
+    if runs:
+        return runs[0][:8]
+
+    return None
+
+
 @st.cache_data
-def get_ad_data_xlsx(uploaded_file):
+def load_excel_smart(uploaded_file):
     """
-    Returns:
-      - codes: sorted unique list of 8-digit ad codes (as strings)
-      - df: the parsed dataframe with normalized column names
-      - ad_code_col: the detected Ad Code column name (normalized)
+    Loads XLSX and detects header row by scanning for "Ad Code".
+    Returns: df (normalized col names), ad_code_col (or None), ad_codes (list[str])
     """
-    # Read as bytes so caching works reliably
     content = uploaded_file.getvalue()
-    bio = io.BytesIO(content)
 
-    # 1) Read without headers to detect the real header row (your file has title rows)
-    raw = pd.read_excel(bio, engine="openpyxl", header=None)
+    raw = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
 
-    # Find a row that contains something like "Ad Code"
     header_row_idx = None
-    for i in range(min(len(raw), 80)):  # scan top 80 rows
+    for i in range(min(len(raw), 80)):
         row = raw.iloc[i].astype(str).str.strip().str.lower()
         if row.str.contains(r"\bad\s*code\b", regex=True, na=False).any():
             header_row_idx = i
             break
-
     if header_row_idx is None:
-        # fallback: assume first row is header
         header_row_idx = 0
 
-    # 2) Re-read using that row as header
-    bio2 = io.BytesIO(content)
-    df = pd.read_excel(bio2, engine="openpyxl", header=header_row_idx)
-
-    # Normalize column names
+    df = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=header_row_idx)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # Try to find "ad code" column robustly
     ad_code_col = None
     for c in df.columns:
         if re.search(r"\bad\s*code\b", c):
             ad_code_col = c
             break
 
-    if ad_code_col is None:
-        # fallback: scan all cells for 8-digit codes
-        all_text = "\n".join(
-            df.astype(str).fillna("").values.ravel().tolist()
-        )
-        codes = sorted(set(AD_CODE_RE.findall(all_text)))
-        return codes, df, None
+    ad_codes = []
+    if ad_code_col and ad_code_col in df.columns:
+        for v in df[ad_code_col].tolist():
+            code = normalize_ad_code(v)
+            if code:
+                ad_codes.append(code)
+    else:
+        all_text = "\n".join(df.astype(str).fillna("").values.ravel().tolist())
+        ad_codes = AD_CODE_RE.findall(all_text)
 
-    # Extract codes from the ad code column, normalize to 8-digit strings
-    col = df[ad_code_col].astype(str).fillna("")
-    extracted = col.apply(lambda x: _digits_only(x)[-8:])  # last 8 digits (safe)
-    codes = sorted(set([c for c in extracted.tolist() if len(c) == 8]))
-
-    return codes, df, ad_code_col
+    ad_codes = sorted(set(ad_codes))
+    return df, ad_code_col, ad_codes
 
 
-# 3. Cache the Assets in memory so they don't reload on every click
 @st.cache_resource
 def load_assets(uploaded_files):
     processed_assets = []
@@ -85,13 +118,13 @@ def load_assets(uploaded_files):
                         continue
                     with z.open(file_info) as f:
                         data = f.read()
-                        processed_assets.append(
-                            {
-                                "name": file_info.filename,
-                                "data": data,
-                                "ext": file_info.filename.split(".")[-1].lower(),
-                            }
-                        )
+                    processed_assets.append(
+                        {
+                            "name": file_info.filename,
+                            "data": data,
+                            "ext": file_info.filename.split(".")[-1].lower(),
+                        }
+                    )
         else:
             processed_assets.append(
                 {
@@ -103,24 +136,36 @@ def load_assets(uploaded_files):
     return processed_assets
 
 
+@st.cache_data
+def build_asset_index(all_assets):
+    """
+    Builds:
+      - index: {ad_code: [assets...]}
+      - unparsed: [asset names with no code found]
+    """
+    index = {}
+    unparsed = []
+
+    for a in all_assets:
+        code = extract_ad_code_from_filename(a["name"])
+        if not code:
+            unparsed.append(a["name"])
+            continue
+        index.setdefault(code, []).append(a)
+
+    return index, unparsed
+
+
 def get_rows_for_code(df: pd.DataFrame, ad_code_col: str | None, code: str) -> pd.DataFrame:
-    """
-    Returns matching rows for an 8-digit code, using robust normalization.
-    If ad_code_col is missing, returns empty df.
-    """
-    if df is None or ad_code_col is None or ad_code_col not in df.columns:
-        return df.iloc[0:0] if df is not None else pd.DataFrame()
+    if df is None or not ad_code_col or ad_code_col not in df.columns:
+        return pd.DataFrame()
 
-    code_digits = _digits_only(code)[-8:]
+    target = normalize_ad_code(code)
+    if not target:
+        return pd.DataFrame()
 
-    col_digits = (
-        df[ad_code_col]
-        .astype(str)
-        .fillna("")
-        .apply(lambda x: _digits_only(x)[-8:])
-    )
-
-    return df[col_digits == code_digits]
+    norm_col = df[ad_code_col].apply(normalize_ad_code)
+    return df[norm_col == target]
 
 
 def preview_asset(asset):
@@ -135,77 +180,94 @@ def preview_asset(asset):
         st.info(f"No inline preview for .{ext}. You can still download it.")
 
 
-# Sidebar Uploads
+# Sidebar
 with st.sidebar:
     st.header("Upload")
     excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
     raw_files = st.file_uploader("Upload Assets or ZIP", accept_multiple_files=True)
+
     if st.button("Clear Cache / Reset"):
         st.cache_resource.clear()
         st.cache_data.clear()
         st.rerun()
 
+
 if excel_file and raw_files:
-    # Load once
+    df, ad_code_col, ad_codes = load_excel_smart(excel_file)
     all_assets = load_assets(raw_files)
-    ad_codes, df, ad_code_col = get_ad_data_xlsx(excel_file)
+    asset_index, unparsed = build_asset_index(all_assets)
 
-    st.success(f"Loaded {len(all_assets)} files. Found {len(ad_codes)} Ad Codes.")
+    st.success(
+        f"Loaded {len(all_assets)} asset files. Found {len(ad_codes)} Ad Codes in Excel. "
+        f"Parsed {len(asset_index)} unique Ad Codes from filenames."
+    )
 
-    # Fast Search
+    if unparsed:
+        with st.expander(f"⚠️ {len(unparsed)} assets had no 8-digit code in filename (click to view)"):
+            st.write(unparsed[:200])
+            if len(unparsed) > 200:
+                st.caption("Showing first 200 only.")
+
+    # Match Summary
+    summary_rows = []
+    for code in ad_codes:
+        summary_rows.append({"Ad Code": code, "Matched Assets": len(asset_index.get(code, []))})
+
+    summary_df = (
+        pd.DataFrame(summary_rows)
+        .sort_values(["Matched Assets", "Ad Code"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+    st.subheader("✅ Match Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    # Search / filter
     search = st.text_input("🔍 Quick Search Ad Code", placeholder="Type to filter...")
     filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
 
-    # Helpful debug if nothing shows
-    with st.expander("🛠 Debug (open if nothing is matching)", expanded=False):
-        st.write("Detected Ad Code column:", ad_code_col)
-        st.write("First 20 extracted codes:", filtered_codes[:20])
-        st.write("First 20 asset names:", [a["name"] for a in all_assets][:20])
+    only_matched = st.checkbox("Show only Ad Codes with matches", value=True)
+    if only_matched:
+        filtered_codes = [c for c in filtered_codes if c in asset_index]
 
+    # Main display
     for code in filtered_codes:
-        code_digits = _digits_only(code)[-8:]
+        matches = asset_index.get(code, [])
 
-        # Robust matching: compare digits-only filename vs digits-only code
-        matches = []
-        for a in all_assets:
-            fname_digits = _digits_only(a["name"])
-            if code_digits and code_digits in fname_digits:
-                matches.append(a)
+        with st.expander(f"✅ Ad {code} — {len(matches)} matched files", expanded=True):
+            c1, c2 = st.columns([1, 1.5])
 
-        if matches:
-            with st.expander(f"✅ Ad {code_digits} - {len(matches)} files found", expanded=True):
-                c1, c2 = st.columns([1, 1.5])
+            with c1:
+                st.markdown("**Ad Details (copy these):**")
+                rows = get_rows_for_code(df, ad_code_col, code)
 
-                with c1:
-                    st.markdown("**Ad Details (from Excel):**")
+                if len(rows) > 0:
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
 
-                    rows = get_rows_for_code(df, ad_code_col, code_digits)
-                    if rows is not None and len(rows) > 0:
-                        # Show the matching row(s)
-                        st.dataframe(rows, use_container_width=True, hide_index=True)
+                    first = rows.iloc[0].to_dict()
+                    pretty = "\n".join(
+                        [f"{k}: {v}" for k, v in first.items() if str(v).strip().lower() != "nan"]
+                    )
+                    st.text_area("Copy-friendly details", pretty, height=240)
+                else:
+                    st.warning("No matching Excel row found for this Ad Code.")
+                    st.write("Detected Ad Code column:", ad_code_col)
 
-                        # Also show as key-value for quick copy
-                        st.markdown("**Key fields (first match):**")
-                        first = rows.iloc[0].to_dict()
-                        # Remove NaNs / blanks for readability
-                        cleaned = {k: v for k, v in first.items() if str(v).strip() not in ["nan", "None", ""]}
-                        st.json(cleaned)
-                    else:
-                        st.warning("No matching rows found in Excel for this Ad Code (check formatting).")
-
-                with c2:
-                    st.markdown("**Creative Previews + Downloads:**")
+            with c2:
+                st.markdown("**Creative Preview + Download:**")
+                if not matches:
+                    st.error("No asset filenames parsed to this Ad Code.")
+                else:
                     for asset in matches:
                         st.caption(f"File: {asset['name']}")
                         preview_asset(asset)
                         st.download_button(
                             "Download",
                             data=asset["data"],
-                            file_name=asset["name"],
-                            key=f"dl_{asset['name']}_{code_digits}",
+                            file_name=asset["name"].split("/")[-1],
+                            key=f"dl_{asset['name']}_{code}",
                         )
                         st.divider()
-        # If no matches, we skip rendering (keeps UI clean)
 
 else:
     st.info("Please upload your Excel file and creative assets to begin.")
