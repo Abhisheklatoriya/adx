@@ -17,20 +17,53 @@ st.title("⚡ Ad Matcher (Excel + Live Processing + Disk Storage)")
 # Excel loader
 # -------------------------------
 @st.cache_data
+import pandas as pd
+import streamlit as st
+
+@st.cache_data
 def load_excel(file):
-    df = pd.read_excel(file, engine="openpyxl")
-    df.columns = [c.strip().lower() for c in df.columns]
+    # 1) Read raw (no header) so we can find the real header row
+    raw = pd.read_excel(file, header=None, engine="openpyxl")
 
-    ad_code_col = next((c for c in df.columns if "ad" in c and "code" in c), None)
+    # 2) Find the row that contains "Ad Code" (case-insensitive)
+    header_row = None
+    for i in range(min(50, len(raw))):
+        row_vals = raw.iloc[i].astype(str).str.strip().str.lower()
+        if row_vals.eq("ad code").any() or row_vals.str.contains(r"\bad\s*code\b", regex=True).any():
+            header_row = i
+            break
+
+    if header_row is None:
+        # Helpful debug: show what the first rows look like
+        raise ValueError(
+            "Could not find the table header row containing 'Ad Code'. "
+            "Try increasing the scan range or confirm the sheet format."
+        )
+
+    # 3) Re-read using the detected header row
+    df = pd.read_excel(file, header=header_row, engine="openpyxl")
+
+    # 4) Normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 5) Find Ad Code column robustly (handles 'Ad Code', 'AdCode', 'Ad  Code', etc.)
+    lower_cols = {c.lower(): c for c in df.columns}
+    ad_code_col = None
+    for c in df.columns:
+        cl = c.lower().strip()
+        if "ad" in cl and "code" in cl:
+            ad_code_col = c
+            break
+
     if not ad_code_col:
-        raise ValueError("Could not find an Ad Code column (expected something like 'Ad Code').")
+        raise ValueError(f"Found header row, but couldn't find Ad Code column. Columns seen: {list(df.columns)}")
 
+    # 6) Clean & keep only 8-digit codes
     df[ad_code_col] = df[ad_code_col].astype(str).str.strip()
     df = df[df[ad_code_col].str.match(r"^\d{8}$")]
 
-    codes = df[ad_code_col].tolist()
-    codes_set = set(codes)
-    return df, ad_code_col, codes, codes_set
+    return df, ad_code_col
+
 
 # -------------------------------
 # Disk workspace (per session)
