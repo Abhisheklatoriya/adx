@@ -3,61 +3,51 @@ import pandas as pd
 import re
 import zipfile
 import io
+import json
+from datetime import datetime, timezone
 
+# 1. Layout
 st.set_page_config(page_title="Ad creative matcher", layout="wide")
-st.title("⚡ Ultra-Fast Ad Matcher (XLSX)")
+st.title("⚡ Ultra-Fast Ad Matcher (XLSX) + Session Save/Restore")
 
 AD_CODE_RE = re.compile(r"\b\d{8}\b")
 
 
 def normalize_ad_code(value) -> str | None:
-    """
-    Returns an 8-digit ad code string if found, else None.
-    Handles:
-      - 48725703
-      - 48725703.0
-      - "Ad Code: 48725703"
-      - "48,725,703"
-    """
     s = "" if value is None else str(value).strip()
 
+    # Prefer exact 8-digit match
     m = AD_CODE_RE.search(s)
     if m:
         return m.group(0)
 
+    # Fallback: digits-only handling
     digits = re.sub(r"\D", "", s)
 
-    # Excel float case: "48725703.0" => digits "487257030"
+    # Excel float case: "48725703.0" -> "487257030"
     if len(digits) == 9 and digits.endswith("0") and len(digits[:-1]) == 8:
         return digits[:-1]
 
     if len(digits) == 8:
         return digits
 
+    # If longer, take first 8 (safer than last-8)
     if len(digits) > 8:
-        # If extra digits exist, usually first 8 is the ad code in these sheets
         return digits[:8]
 
     return None
 
 
 def extract_ad_code_from_filename(filename: str) -> str | None:
-    """
-    Extract an 8-digit ad code from filenames like:
-      asset_ad_48734339_WAUOgJ.mp4
-
-    Strategy:
-      1) Prefer an explicit 8-digit match anywhere in filename.
-      2) Fallback: take the first 8 digits from any longer digit run.
-    """
     if not filename:
         return None
 
+    # best: direct 8-digit match anywhere
     m = AD_CODE_RE.search(filename)
     if m:
         return m.group(0)
 
-    # fallback: any long digit run
+    # fallback: first long digit run, take first 8
     runs = re.findall(r"\d{8,}", filename)
     if runs:
         return runs[0][:8]
@@ -66,14 +56,13 @@ def extract_ad_code_from_filename(filename: str) -> str | None:
 
 
 @st.cache_data
-def load_excel_smart(uploaded_file):
+def load_excel_smart(excel_bytes: bytes):
     """
-    Loads XLSX and detects header row by scanning for "Ad Code".
-    Returns: df (normalized col names), ad_code_col (or None), ad_codes (list[str])
+    Reads XLSX bytes.
+    Detects header row by scanning for "Ad Code".
+    Returns df, ad_code_col, ad_codes(list[str])
     """
-    content = uploaded_file.getvalue()
-
-    raw = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
+    raw = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl", header=None)
 
     header_row_idx = None
     for i in range(min(len(raw), 80)):
@@ -84,7 +73,7 @@ def load_excel_smart(uploaded_file):
     if header_row_idx is None:
         header_row_idx = 0
 
-    df = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=header_row_idx)
+    df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl", header=header_row_idx)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     ad_code_col = None
@@ -109,6 +98,10 @@ def load_excel_smart(uploaded_file):
 
 @st.cache_resource
 def load_assets(uploaded_files):
+    """
+    Loads uploaded files/zip(s) into memory.
+    Returns list of dicts: {name,data,ext}
+    """
     processed_assets = []
     for uploaded_file in uploaded_files:
         if uploaded_file.name.lower().endswith(".zip"):
@@ -139,9 +132,8 @@ def load_assets(uploaded_files):
 @st.cache_data
 def build_asset_index(all_assets):
     """
-    Builds:
-      - index: {ad_code: [assets...]}
-      - unparsed: [asset names with no code found]
+    index: {ad_code: [assets...]}
+    unparsed: [asset names without code]
     """
     index = {}
     unparsed = []
@@ -180,39 +172,151 @@ def preview_asset(asset):
         st.info(f"No inline preview for .{ext}. You can still download it.")
 
 
-# Sidebar
+def restore_session_zip(session_zip_file):
+    """
+    Reads a "session zip" and returns:
+      excel_bytes, assets(list)
+    Expected structure:
+      session/ad_details.xlsx
+      session/assets/<files...>
+      session/session_meta.json (optional)
+    """
+    excel_bytes = None
+    assets = []
+
+    with zipfile.ZipFile(session_zip_file) as z:
+        # Find excel
+        # Prefer session/ad_details.xlsx, else first .xlsx found
+        names = z.namelist()
+        preferred = [n for n in names if n.lower().endswith("session/ad_details.xlsx")]
+        if preferred:
+            excel_name = preferred[0]
+        else:
+            xlsx_files = [n for n in names if n.lower().endswith(".xlsx")]
+            excel_name = xlsx_files[0] if xlsx_files else None
+
+        if excel_name:
+            with z.open(excel_name) as f:
+                excel_bytes = f.read()
+
+        # Load assets under session/assets/
+        for n in names:
+            if n.endswith("/") or "__MACOSX" in n:
+                continue
+            if n.lower().startswith("session/assets/"):
+                with z.open(n) as f:
+                    data = f.read()
+                # Keep original filename AFTER session/assets/
+                original_name = n[len("session/assets/") :]
+                if not original_name:
+                    continue
+                assets.append(
+                    {
+                        "name": original_name,
+                        "data": data,
+                        "ext": original_name.split(".")[-1].lower() if "." in original_name else "",
+                    }
+                )
+
+    return excel_bytes, assets
+
+
+def build_session_zip_bytes(excel_bytes: bytes, all_assets: list[dict]) -> bytes:
+    """
+    Builds a single ZIP containing excel + all assets + meta.
+    NOTE: This builds in-memory; very large sessions may exceed RAM on Streamlit Cloud.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        # Excel
+        z.writestr("session/ad_details.xlsx", excel_bytes)
+
+        # Assets
+        for a in all_assets:
+            safe_name = a["name"].lstrip("/").replace("\\", "/")
+            z.writestr(f"session/assets/{safe_name}", a["data"])
+
+        # Meta
+        meta = {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "asset_count": len(all_assets),
+        }
+        z.writestr("session/session_meta.json", json.dumps(meta, indent=2))
+
+    return buf.getvalue()
+
+
+# Sidebar: upload + restore + reset
 with st.sidebar:
-    st.header("Upload")
-    excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-    raw_files = st.file_uploader("Upload Assets or ZIP", accept_multiple_files=True)
+    st.header("Upload / Restore")
+
+    restore_zip = st.file_uploader("Restore Session ZIP", type=["zip"])
+    st.divider()
+
+    excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], disabled=bool(restore_zip))
+    raw_files = st.file_uploader(
+        "Upload Assets or ZIP",
+        accept_multiple_files=True,
+        disabled=bool(restore_zip),
+    )
 
     if st.button("Clear Cache / Reset"):
         st.cache_resource.clear()
         st.cache_data.clear()
+        st.session_state.clear()
         st.rerun()
 
 
-if excel_file and raw_files:
-    df, ad_code_col, ad_codes = load_excel_smart(excel_file)
+# Decide source: restored session OR manual upload
+excel_bytes = None
+all_assets = None
+
+if restore_zip:
+    excel_bytes, all_assets = restore_session_zip(restore_zip)
+    if not excel_bytes:
+        st.error("Restore ZIP did not contain an Excel (.xlsx). Expected session/ad_details.xlsx")
+    if not all_assets:
+        st.warning("Restore ZIP contained no assets under session/assets/")
+elif excel_file and raw_files:
+    excel_bytes = excel_file.getvalue()
     all_assets = load_assets(raw_files)
+
+# Main
+if excel_bytes and all_assets is not None:
+    df, ad_code_col, ad_codes = load_excel_smart(excel_bytes)
     asset_index, unparsed = build_asset_index(all_assets)
 
     st.success(
-        f"Loaded {len(all_assets)} asset files. Found {len(ad_codes)} Ad Codes in Excel. "
+        f"Loaded {len(all_assets)} assets. Found {len(ad_codes)} Ad Codes in Excel. "
         f"Parsed {len(asset_index)} unique Ad Codes from filenames."
     )
 
+    # SAVE SESSION ZIP BUTTON
+    st.subheader("💾 Save this session")
+    st.caption("This downloads a ZIP with the Excel + all uploaded assets so someone can restore instantly later.")
+    try:
+        session_zip_bytes = build_session_zip_bytes(excel_bytes, all_assets)
+        st.download_button(
+            "⬇️ Download Session ZIP",
+            data=session_zip_bytes,
+            file_name="ad_matcher_session.zip",
+            mime="application/zip",
+            key="download_session_zip",
+        )
+    except Exception as e:
+        st.error(
+            "Could not build session ZIP (likely too large for in-memory zipping on Streamlit Cloud)."
+        )
+        st.exception(e)
+
     if unparsed:
-        with st.expander(f"⚠️ {len(unparsed)} assets had no 8-digit code in filename (click to view)"):
+        with st.expander(f"⚠️ {len(unparsed)} assets had no 8-digit ad code in filename"):
             st.write(unparsed[:200])
             if len(unparsed) > 200:
                 st.caption("Showing first 200 only.")
 
-    # Match Summary
-    summary_rows = []
-    for code in ad_codes:
-        summary_rows.append({"Ad Code": code, "Matched Assets": len(asset_index.get(code, []))})
-
+    # Match summary
+    summary_rows = [{"Ad Code": code, "Matched Assets": len(asset_index.get(code, []))} for code in ad_codes]
     summary_df = (
         pd.DataFrame(summary_rows)
         .sort_values(["Matched Assets", "Ad Code"], ascending=[False, True])
@@ -222,7 +326,6 @@ if excel_file and raw_files:
     st.subheader("✅ Match Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    # Search / filter
     search = st.text_input("🔍 Quick Search Ad Code", placeholder="Type to filter...")
     filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
 
@@ -230,10 +333,8 @@ if excel_file and raw_files:
     if only_matched:
         filtered_codes = [c for c in filtered_codes if c in asset_index]
 
-    # Main display
     for code in filtered_codes:
         matches = asset_index.get(code, [])
-
         with st.expander(f"✅ Ad {code} — {len(matches)} matched files", expanded=True):
             c1, c2 = st.columns([1, 1.5])
 
@@ -243,12 +344,11 @@ if excel_file and raw_files:
 
                 if len(rows) > 0:
                     st.dataframe(rows, use_container_width=True, hide_index=True)
-
                     first = rows.iloc[0].to_dict()
                     pretty = "\n".join(
                         [f"{k}: {v}" for k, v in first.items() if str(v).strip().lower() != "nan"]
                     )
-                    st.text_area("Copy-friendly details", pretty, height=240)
+                    st.text_area("Copy-friendly details", pretty, height=240, key=f"copy_{code}")
                 else:
                     st.warning("No matching Excel row found for this Ad Code.")
                     st.write("Detected Ad Code column:", ad_code_col)
@@ -256,7 +356,7 @@ if excel_file and raw_files:
             with c2:
                 st.markdown("**Creative Preview + Download:**")
                 if not matches:
-                    st.error("No asset filenames parsed to this Ad Code.")
+                    st.error("No assets matched this Ad Code (from filename parsing).")
                 else:
                     for asset in matches:
                         st.caption(f"File: {asset['name']}")
@@ -270,4 +370,4 @@ if excel_file and raw_files:
                         st.divider()
 
 else:
-    st.info("Please upload your Excel file and creative assets to begin.")
+    st.info("Upload Excel + assets OR restore a previously saved session ZIP.")
