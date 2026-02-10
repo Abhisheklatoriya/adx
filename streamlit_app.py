@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import zipfile
 import re
-import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Optional, Set, List
 
 # -------------------------------
 # App Config
@@ -30,18 +30,17 @@ def load_excel(file):
 
     codes = df[ad_code_col].tolist()
     codes_set = set(codes)
-
     return df, ad_code_col, codes, codes_set
 
 # -------------------------------
 # Disk workspace (per session)
 # -------------------------------
-def ensure_workspace():
+def ensure_workspace() -> Path:
     if "workspace_dir" not in st.session_state:
         st.session_state.workspace_dir = tempfile.mkdtemp(prefix="admatcher_")
     return Path(st.session_state.workspace_dir)
 
-def get_output_dir():
+def get_output_dir() -> Path:
     base = ensure_workspace()
     out = base / "output"
     out.mkdir(parents=True, exist_ok=True)
@@ -52,69 +51,46 @@ def get_output_dir():
 # -------------------------------
 CODE_RE = re.compile(r"\b(\d{8})\b")
 
-def extract_code_from_name(name: str, valid_codes_set: set[str]) -> str | None:
-    """
-    Find an 8-digit code in filename. Return it if it's one of the valid codes from Excel.
-    """
-    # Try all 8-digit numbers found in the string
+def extract_code_from_name(name: str, valid_codes_set: Set[str]) -> Optional[str]:
     for m in CODE_RE.findall(name):
         if m in valid_codes_set:
             return m
     return None
 
 def safe_filename(p: str) -> str:
-    # keep nested folders but avoid weird absolute paths
     p = p.replace("\\", "/")
     p = p.lstrip("/").lstrip("./")
     return p
 
-def write_bytes_to_disk(dest_path: Path, data: bytes):
+def copy_stream_to_disk(src_fileobj, dest_path: Path):
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest_path, "wb") as f:
-        f.write(data)
-
-def copy_file_to_disk(uploaded_file, dest_path: Path):
-    """
-    Streamlit UploadedFile is file-like. We can stream copy to disk without getvalue().
-    """
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    uploaded_file.seek(0)
     with open(dest_path, "wb") as out:
-        shutil.copyfileobj(uploaded_file, out, length=1024 * 1024)  # 1MB chunks
+        shutil.copyfileobj(src_fileobj, out, length=1024 * 1024)  # 1MB chunks
 
 # -------------------------------
 # Incremental processing
 # -------------------------------
-def process_new_uploads(uploaded_files, valid_codes_set: set[str]):
-    """
-    Process only new uploads; write matched assets to disk immediately.
-    """
-    if "processed_names" not in st.session_state:
-        st.session_state.processed_names = set()
+def process_new_uploads(uploaded_files, valid_codes_set: Set[str]) -> None:
+    if "processed_keys" not in st.session_state:
+        st.session_state.processed_keys = set()
 
     out_dir = get_output_dir()
 
     progress = st.progress(0.0)
     status = st.empty()
 
-    # Rough total steps: count files + zip entries
+    # Rough steps: files + zip entries
     steps = 0
-    zip_entries_map = {}
-
     for uf in uploaded_files:
         key = f"{uf.name}|{getattr(uf, 'size', 'na')}"
-        if key in st.session_state.processed_names:
+        if key in st.session_state.processed_keys:
             continue
 
         if uf.name.lower().endswith(".zip"):
             try:
                 uf.seek(0)
                 with zipfile.ZipFile(uf) as z:
-                    entries = [
-                        i for i in z.infolist()
-                        if (not i.is_dir()) and "__MACOSX" not in i.filename
-                    ]
-                    zip_entries_map[key] = len(entries)
+                    entries = [i for i in z.infolist() if (not i.is_dir()) and "__MACOSX" not in i.filename]
                     steps += max(len(entries), 1)
             except Exception:
                 steps += 1
@@ -129,35 +105,28 @@ def process_new_uploads(uploaded_files, valid_codes_set: set[str]):
 
     for uf in uploaded_files:
         key = f"{uf.name}|{getattr(uf, 'size', 'na')}"
-        if key in st.session_state.processed_names:
+        if key in st.session_state.processed_keys:
             continue
 
         status.write(f"Processing **{uf.name}** …")
 
-        # ZIP: stream entries one-by-one
         if uf.name.lower().endswith(".zip"):
             try:
                 uf.seek(0)
                 with zipfile.ZipFile(uf) as z:
-                    entries = [
-                        i for i in z.infolist()
-                        if (not i.is_dir()) and "__MACOSX" not in i.filename
-                    ]
-
+                    entries = [i for i in z.infolist() if (not i.is_dir()) and "__MACOSX" not in i.filename]
                     if not entries:
                         done += 1
                         progress.progress(min(done / steps, 1.0))
                     else:
                         for info in entries:
                             fname = safe_filename(info.filename)
-
                             code = extract_code_from_name(fname, valid_codes_set)
+
                             if code:
                                 dest = out_dir / code / fname
                                 with z.open(info) as src:
-                                    dest.parent.mkdir(parents=True, exist_ok=True)
-                                    with open(dest, "wb") as out:
-                                        shutil.copyfileobj(src, out, length=1024 * 1024)
+                                    copy_stream_to_disk(src, dest)
 
                             done += 1
                             progress.progress(min(done / steps, 1.0))
@@ -166,43 +135,37 @@ def process_new_uploads(uploaded_files, valid_codes_set: set[str]):
                 done += 1
                 progress.progress(min(done / steps, 1.0))
 
-        # Normal file: copy it if it matches a code
         else:
             fname = safe_filename(uf.name)
             code = extract_code_from_name(fname, valid_codes_set)
             if code:
                 dest = out_dir / code / fname
                 try:
-                    copy_file_to_disk(uf, dest)
+                    uf.seek(0)
+                    copy_stream_to_disk(uf, dest)
                 except Exception as e:
                     st.warning(f"Could not save file {uf.name}: {e}")
 
             done += 1
             progress.progress(min(done / steps, 1.0))
 
-        st.session_state.processed_names.add(key)
+        st.session_state.processed_keys.add(key)
 
     status.write("✅ Done processing currently uploaded files.")
 
-def list_matches_for_code(code: str):
+def list_matches_for_code(code: str) -> List[Path]:
     out_dir = get_output_dir() / code
     if not out_dir.exists():
         return []
-    # Return files (recursive)
     return sorted([p for p in out_dir.rglob("*") if p.is_file()])
 
 def ext_of(path: Path) -> str:
     return path.suffix.lower().lstrip(".")
 
-def read_small_preview(path: Path, max_mb=25):
-    """
-    For previews, don’t load huge files into memory.
-    Only read up to max_mb.
-    """
+def read_small_preview(path: Path, max_mb: int = 25) -> Optional[bytes]:
     max_bytes = max_mb * 1024 * 1024
-    size = path.stat().st_size
-    if size > max_bytes:
-        return None  # too big to preview safely
+    if path.stat().st_size > max_bytes:
+        return None
     return path.read_bytes()
 
 # -------------------------------
@@ -214,13 +177,9 @@ with st.sidebar:
     raw_files = st.file_uploader("Upload Assets or ZIPs", accept_multiple_files=True)
 
     if st.button("Reset session"):
-        # cleanup workspace
         if "workspace_dir" in st.session_state:
-            try:
-                shutil.rmtree(st.session_state.workspace_dir, ignore_errors=True)
-            except Exception:
-                pass
-        for k in ["workspace_dir", "processed_names"]:
+            shutil.rmtree(st.session_state.workspace_dir, ignore_errors=True)
+        for k in ["workspace_dir", "processed_keys"]:
             if k in st.session_state:
                 del st.session_state[k]
         st.cache_data.clear()
@@ -246,7 +205,6 @@ if raw_files:
 else:
     st.info("Upload creatives/ZIPs — matches will appear as soon as files are processed.")
 
-# UI: Search + matches
 search = st.text_input("🔍 Search Ad Code", placeholder="Type partial or full 8-digit code…")
 filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
 
@@ -254,7 +212,6 @@ only_matched = st.checkbox("Show only ad codes with matches", value=True)
 
 for code in filtered_codes:
     files = list_matches_for_code(code)
-
     if only_matched and not files:
         continue
 
@@ -272,10 +229,8 @@ for code in filtered_codes:
                 for p in files:
                     st.caption(str(p.relative_to(get_output_dir() / code)))
 
-                    ext = ext_of(p)
-
-                    # Preview safely (only if small)
                     preview_bytes = read_small_preview(p, max_mb=25)
+                    ext = ext_of(p)
 
                     if preview_bytes is None:
                         st.info("Preview skipped (file is large). Download to view.")
@@ -287,10 +242,9 @@ for code in filtered_codes:
                         elif ext in ["jpg", "jpeg", "png", "gif"]:
                             st.image(preview_bytes)
 
-                    # Always allow download (streamlit will read bytes for the button)
                     st.download_button(
                         "Download",
-                        data=p.read_bytes() if p.stat().st_size <= 200 * 1024 * 1024 else open(p, "rb"),
+                        data=p.read_bytes(),  # note: for very large files, we can optimize this next
                         file_name=p.name,
                         key=f"dl_{code}_{p.as_posix()}"
                     )
