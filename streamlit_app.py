@@ -1,15 +1,3 @@
-# streamlit_app.py
-# ------------------------------------------------------------
-# Ad Creative Matcher (Excel/XLSX + live incremental ZIP/file processing)
-# - Reads an Excel report that has title rows ABOVE the real header row
-# - Auto-detects the header row containing "Ad Code"
-# - Extracts valid 8-digit ad codes from the sheet
-# - Processes uploaded ZIPs/files incrementally (disk-based, not RAM-based)
-# - Matches creatives by finding an 8-digit ad code inside the filename
-# - Writes matched files to disk under output/<ad_code>/...
-# - Shows matches immediately as they are processed
-# ------------------------------------------------------------
-
 import re
 import zipfile
 import shutil
@@ -20,74 +8,42 @@ from typing import Optional, Set, List, Tuple
 import streamlit as st
 import pandas as pd
 
-# -------------------------------
-# App Config
-# -------------------------------
 st.set_page_config(page_title="Ad Creative Matcher", layout="wide")
 st.title("⚡ Ad Creative Matcher (Excel + Live Processing)")
 
-# -------------------------------
-# Constants / Regex
-# -------------------------------
-CODE_RE = re.compile(r"\b(\d{8})\b", flags=re.IGNORECASE)
+CODE_RE = re.compile(r"\b(\d{8})\b")
 
-# -------------------------------
-# Workspace helpers (disk-based)
-# -------------------------------
+
 def ensure_workspace() -> Path:
-    """
-    Create a per-session temp workspace on disk.
-    """
     if "workspace_dir" not in st.session_state:
         st.session_state.workspace_dir = tempfile.mkdtemp(prefix="admatcher_")
     return Path(st.session_state.workspace_dir)
 
+
 def output_dir() -> Path:
-    """
-    Root output folder where matched assets are written.
-    """
     out = ensure_workspace() / "output"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
+
 def reset_workspace() -> None:
-    """
-    Clears workspace and processing state.
-    """
     if "workspace_dir" in st.session_state:
         shutil.rmtree(st.session_state.workspace_dir, ignore_errors=True)
         del st.session_state["workspace_dir"]
-
-    for k in ["processed_keys"]:
-        if k in st.session_state:
-            del st.session_state[k]
-
+    if "processed_keys" in st.session_state:
+        del st.session_state["processed_keys"]
     st.cache_data.clear()
 
-# -------------------------------
-# Excel loader (auto header-row detection)
-# -------------------------------
+
 @st.cache_data
 def load_excel_auto_header(excel_file) -> Tuple[pd.DataFrame, str, List[str], Set[str]]:
-    """
-    Loads an Excel sheet that has title rows above the real header row.
-    Auto-detects the header row by scanning for a cell that contains 'Ad Code'.
-
-    Returns:
-      df: cleaned dataframe
-      ad_code_col: detected column name containing ad code
-      ad_codes: list of 8-digit ad codes
-      ad_codes_set: set of 8-digit ad codes
-    """
-    # Read without headers so we can find where the header actually starts
+    # Read raw so we can locate the real header row (your sheet has title rows above)
     raw = pd.read_excel(excel_file, header=None, engine="openpyxl")
 
     header_row = None
-    scan_rows = min(80, len(raw))  # scan first 80 rows (safe for title-heavy sheets)
-
+    scan_rows = min(80, len(raw))
     for i in range(scan_rows):
         row_vals = raw.iloc[i].astype(str).str.strip().str.lower()
-        # match cells like "Ad Code" or "Ad  Code"
         if row_vals.str.contains(r"\bad\s*code\b", regex=True).any():
             header_row = i
             break
@@ -95,13 +51,10 @@ def load_excel_auto_header(excel_file) -> Tuple[pd.DataFrame, str, List[str], Se
     if header_row is None:
         raise ValueError("Could not find a header row containing 'Ad Code' in the first 80 rows.")
 
-    # Re-read using the detected header row
+    # Re-read using detected header row
     df = pd.read_excel(excel_file, header=header_row, engine="openpyxl")
-
-    # Normalize column names (keep originals but strip)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Find the Ad Code column robustly
     ad_code_col = None
     for c in df.columns:
         cl = c.lower().strip()
@@ -110,83 +63,62 @@ def load_excel_auto_header(excel_file) -> Tuple[pd.DataFrame, str, List[str], Se
             break
 
     if not ad_code_col:
-        raise ValueError(f"Found header row, but could not find an 'Ad Code' column. Columns: {list(df.columns)}")
+        raise ValueError(f"Header found, but no Ad Code column. Columns: {list(df.columns)}")
 
-    # Clean ad codes: keep only 8-digit numeric strings
     df[ad_code_col] = df[ad_code_col].astype(str).str.strip()
     df = df[df[ad_code_col].str.match(r"^\d{8}$")]
 
     ad_codes = df[ad_code_col].tolist()
     ad_codes_set = set(ad_codes)
-
     return df, ad_code_col, ad_codes, ad_codes_set
 
-# -------------------------------
-# Matching helpers
-# -------------------------------
+
 def safe_relpath(p: str) -> str:
-    """
-    Normalize paths inside zips (avoid absolute paths, Windows slashes).
-    """
     p = p.replace("\\", "/")
     p = p.lstrip("/").lstrip("./")
     return p
 
+
 def extract_ad_code_from_filename(name: str, valid_codes: Set[str]) -> Optional[str]:
-    """
-    Find any 8-digit number in filename and return it if it exists in valid_codes.
-    """
     for m in CODE_RE.findall(name):
         if m in valid_codes:
             return m
     return None
 
+
 def copy_stream_to_disk(src, dest: Path) -> None:
-    """
-    Copy a file-like object to disk in chunks (memory-safe).
-    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with open(dest, "wb") as out:
         shutil.copyfileobj(src, out, length=1024 * 1024)  # 1MB chunks
 
+
 def list_matches_for_code(code: str) -> List[Path]:
-    """
-    List all matched files written for a given ad code.
-    """
     base = output_dir() / code
     if not base.exists():
         return []
     return sorted([p for p in base.rglob("*") if p.is_file()])
 
+
 def file_ext(p: Path) -> str:
     return p.suffix.lower().lstrip(".")
 
+
 def read_preview_bytes(p: Path, max_mb: int = 25) -> Optional[bytes]:
-    """
-    For previews, avoid loading huge files. Only read up to max_mb.
-    """
     if p.stat().st_size > max_mb * 1024 * 1024:
         return None
     return p.read_bytes()
 
-# -------------------------------
-# Incremental processing (runs each rerun; processes only new files)
-# -------------------------------
+
 def process_new_uploads(uploaded_files, valid_codes: Set[str]) -> None:
-    """
-    Process uploaded files/ZIPs and write matched items to disk immediately.
-    Uses session_state to avoid reprocessing already-seen uploads.
-    """
     if "processed_keys" not in st.session_state:
         st.session_state.processed_keys = set()
 
-    # Estimate total steps for progress bar
+    # Estimate steps
     steps = 0
-    file_keys = []
-
+    items = []
     for uf in uploaded_files:
         key = f"{uf.name}|{getattr(uf, 'size', 'na')}"
-        file_keys.append((uf, key))
+        items.append((uf, key))
         if key in st.session_state.processed_keys:
             continue
 
@@ -214,13 +146,12 @@ def process_new_uploads(uploaded_files, valid_codes: Set[str]) -> None:
     done = 0
     out_root = output_dir()
 
-    for uf, key in file_keys:
+    for uf, key in items:
         if key in st.session_state.processed_keys:
             continue
 
         status.write(f"Processing **{uf.name}** …")
 
-        # ZIP handling
         if uf.name.lower().endswith(".zip"):
             try:
                 uf.seek(0)
@@ -251,7 +182,6 @@ def process_new_uploads(uploaded_files, valid_codes: Set[str]) -> None:
                 done += 1
                 progress.progress(min(done / steps, 1.0))
 
-        # Regular file handling
         else:
             fname = safe_relpath(uf.name)
             code = extract_ad_code_from_filename(fname, valid_codes)
@@ -270,9 +200,7 @@ def process_new_uploads(uploaded_files, valid_codes: Set[str]) -> None:
 
     status.write("✅ Finished processing currently uploaded files.")
 
-# -------------------------------
-# Sidebar
-# -------------------------------
+
 with st.sidebar:
     st.header("Upload")
     excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
@@ -283,9 +211,6 @@ with st.sidebar:
         reset_workspace()
         st.rerun()
 
-# -------------------------------
-# Main
-# -------------------------------
 if not excel_file:
     st.info("Upload the Excel ad list to begin.")
     st.stop()
@@ -296,20 +221,17 @@ except Exception as e:
     st.error(f"Excel load error: {e}")
     st.stop()
 
-st.success(f"Loaded **{len(df)}** ads from Excel. Detected ad code column: **{ad_code_col}**")
+st.success(f"Loaded **{len(df)}** ads. Detected Ad Code column: **{ad_code_col}**")
 
 if assets_files:
     process_new_uploads(assets_files, ad_codes_set)
 else:
     st.info("Upload creatives/ZIPs — matches will appear as soon as files are processed.")
 
-# Search + filters
 search = st.text_input("🔍 Search Ad Code", placeholder="Type partial or full 8-digit ad code…")
 filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
-
 only_matched = st.checkbox("Show only ad codes with matches", value=True)
 
-# Display results
 for code in filtered_codes:
     matches = list_matches_for_code(code)
     if only_matched and not matches:
@@ -324,7 +246,7 @@ for code in filtered_codes:
 
         with c2:
             if not matches:
-                st.caption("No matching files yet. Upload more ZIPs/files…")
+                st.caption("No matching files yet.")
             else:
                 for p in matches:
                     rel = p.relative_to(output_dir() / code)
@@ -343,8 +265,6 @@ for code in filtered_codes:
                         elif ext in ["jpg", "jpeg", "png", "gif"]:
                             st.image(preview)
 
-                    # Download (note: reads bytes; okay for typical creatives.
-                    # If you have very large files, we can add a "no-preview, no-read" download strategy.)
                     st.download_button(
                         "Download",
                         data=p.read_bytes(),
