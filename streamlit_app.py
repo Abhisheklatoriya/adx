@@ -1,218 +1,96 @@
 import streamlit as st
-import pandas as pd
+import docx
 import re
 import zipfile
 import io
-from typing import Tuple, List, Optional
 
-# 1) Page config
+# 1. Expand limits and set layout
 st.set_page_config(page_title="Ad creative matcher", layout="wide")
-st.title("⚡ Ultra-Fast Ad Matcher (XLSX)")
 
-CODE_RE = re.compile(r"\b(\d{8})\b")
-
-
-# -----------------------------
-# XLSX parsing (replaces DOCX)
-# - Auto-detects the header row that contains "Ad Code"
-# - Returns ad_codes + dataframe + ad_code_col
-# -----------------------------
+# 2. Cache the Word Document extraction
 @st.cache_data
-def get_ad_data_xlsx(file) -> Tuple[List[str], pd.DataFrame, str]:
-    # Read raw to find header row (your sheet has title rows above the real header)
-    raw = pd.read_excel(file, header=None, engine="openpyxl")
+def get_ad_data(file):
+    doc = docx.Document(file)
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    codes = sorted(list(set(re.findall(r'\b\d{8}\b', text))))
+    return codes, text
 
-    header_row = None
-    for i in range(min(80, len(raw))):
-        row = raw.iloc[i].astype(str).str.strip().str.lower()
-        if row.str.contains(r"\bad\s*code\b", regex=True).any():
-            header_row = i
-            break
-
-    if header_row is None:
-        raise ValueError("Could not find a header row containing 'Ad Code' in the first 80 rows.")
-
-    df = pd.read_excel(file, header=header_row, engine="openpyxl")
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Find the ad code column
-    ad_code_col = None
-    for c in df.columns:
-        cl = c.lower().strip()
-        if "ad" in cl and "code" in cl:
-            ad_code_col = c
-            break
-
-    if not ad_code_col:
-        raise ValueError(f"Header found but no Ad Code column. Columns: {list(df.columns)}")
-
-    # Normalize ad codes
-    df[ad_code_col] = df[ad_code_col].astype(str).str.strip()
-    df = df[df[ad_code_col].str.match(r"^\d{8}$")]
-
-    ad_codes = sorted(df[ad_code_col].unique().tolist())
-    return ad_codes, df, ad_code_col
-
-
-# -----------------------------
-# Asset loading
-# - Original behavior: load everything into memory
-# - Safe mode: do NOT keep bytes for big ZIPs; store only file handles (zip entry pointers)
-#   (Still allows preview + download, but avoids RAM blowups)
-# -----------------------------
+# 3. Cache the Assets in memory so they don't reload on every click
 @st.cache_resource
-def load_assets(uploaded_files, safe_mode: bool):
-    """
-    Returns a list of asset dicts.
-    In safe_mode:
-      - For ZIP entries: store (zip_bytes, entry_name) instead of fully reading bytes.
-      - For normal files: store bytes (usually smaller), but you can extend to stream too.
-    """
+def load_assets(uploaded_files):
     processed_assets = []
-
     for uploaded_file in uploaded_files:
-        name_lower = uploaded_file.name.lower()
-
-        if name_lower.endswith(".zip"):
-            zip_bytes = uploaded_file.getvalue()  # NOTE: still reads ZIP into memory once
-            # If your zips are huge, you should not use this approach (disk-based is needed).
-            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-
-            for info in zf.infolist():
-                if info.is_dir() or "__MACOSX" in info.filename:
-                    continue
-
-                ext = info.filename.split(".")[-1].lower() if "." in info.filename else ""
-
-                if safe_mode:
-                    # Don't read file bytes yet; store reference
-                    processed_assets.append({
-                        "name": info.filename,
-                        "ext": ext,
-                        "kind": "zip_ref",
-                        "zip_bytes": zip_bytes,
-                        "zip_member": info.filename,
-                    })
-                else:
-                    # Original behavior: read file fully into memory
-                    with zf.open(info) as f:
+        if uploaded_file.name.lower().endswith('.zip'):
+            with zipfile.ZipFile(uploaded_file) as z:
+                for file_info in z.infolist():
+                    if file_info.is_dir() or "__MACOSX" in file_info.filename:
+                        continue
+                    # Read into memory
+                    with z.open(file_info) as f:
                         data = f.read()
-                    processed_assets.append({
-                        "name": info.filename,
-                        "ext": ext,
-                        "kind": "bytes",
-                        "data": data,
-                    })
-
+                        processed_assets.append({
+                            "name": file_info.filename,
+                            "data": data,
+                            "ext": file_info.filename.split('.')[-1].lower()
+                        })
         else:
-            # Individual file
-            data = uploaded_file.getvalue()
+            # Handle individual files
             processed_assets.append({
                 "name": uploaded_file.name,
-                "ext": uploaded_file.name.split(".")[-1].lower() if "." in uploaded_file.name else "",
-                "kind": "bytes",
-                "data": data,
+                "data": uploaded_file.getvalue(),
+                "ext": uploaded_file.name.split('.')[-1].lower()
             })
-
     return processed_assets
 
+st.title("⚡ Ultra-Fast Ad Matcher")
 
-def asset_bytes(asset) -> Optional[bytes]:
-    """Resolve bytes for an asset (either direct bytes or a zip member reference)."""
-    if asset["kind"] == "bytes":
-        return asset["data"]
-
-    if asset["kind"] == "zip_ref":
-        # Read that specific member on demand
-        zf = zipfile.ZipFile(io.BytesIO(asset["zip_bytes"]))
-        with zf.open(asset["zip_member"]) as f:
-            return f.read()
-
-    return None
-
-
-# -----------------------------
-# Sidebar
-# -----------------------------
+# Sidebar Uploads
 with st.sidebar:
     st.header("Upload")
-
-    xlsx_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+    word_file = st.file_uploader("Upload Word Doc", type=['docx'])
     raw_files = st.file_uploader("Upload Assets or ZIP", accept_multiple_files=True)
-
-    safe_mode = st.toggle(
-        "Safe mode (lower RAM, read ZIP files on-demand)",
-        value=True,
-        help="Turn ON if you have large ZIPs. Turn OFF only for small uploads (faster previews)."
-    )
-
     if st.button("Clear Cache / Reset"):
         st.cache_resource.clear()
-        st.cache_data.clear()
         st.rerun()
 
-
-# -----------------------------
-# Main
-# -----------------------------
-if xlsx_file and raw_files:
-    # Load assets + Excel data
-    all_assets = load_assets(raw_files, safe_mode=safe_mode)
-    ad_codes, df, ad_code_col = get_ad_data_xlsx(xlsx_file)
+if word_file and raw_files:
+    # This runs once and stays in memory
+    all_assets = load_assets(raw_files)
+    ad_codes, full_text = get_ad_data(word_file)
 
     st.success(f"Loaded {len(all_assets)} files. Found {len(ad_codes)} Ad Codes.")
-
+    
     # Fast Search
     search = st.text_input("🔍 Quick Search Ad Code", placeholder="Type to filter...")
     filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
 
     for code in filtered_codes:
         # Match based on filename containing the code
-        matches = [a for a in all_assets if code in a["name"]]
-
+        matches = [a for a in all_assets if code in a['name']]
+        
         if matches:
             with st.expander(f"✅ Ad {code} - {len(matches)} files found", expanded=True):
                 c1, c2 = st.columns([1, 1.5])
-
-                # LEFT: Ad Specs (from XLSX)
+                
                 with c1:
                     st.markdown("**Ad Specs:**")
-                    row = df[df[ad_code_col] == code]
-                    if len(row) == 0:
-                        st.info("No row found in Excel for this Ad Code.")
-                    else:
-                        # show full row(s)
-                        st.dataframe(row, use_container_width=True)
-
-                # RIGHT: Creative previews + downloads
+                    pattern = f"{code}.*?(?=\\n\\n|Ad Code:|$)"
+                    found = re.search(pattern, full_text, re.DOTALL)
+                    st.code(found.group(0) if found else f"Ad Code: {code}", language=None)
+                
                 with c2:
                     for asset in matches:
                         st.caption(f"File: {asset['name']}")
-
-                        data = asset_bytes(asset)  # on-demand if safe_mode zip_ref
-
-                        # Preview logic
-                        if data is not None:
-                            if asset["ext"] in ["mp4", "mov", "webm"]:
-                                st.video(data)
-                            elif asset["ext"] in ["mp3", "wav"]:
-                                st.audio(data)
-                            elif asset["ext"] in ["jpg", "jpeg", "png", "gif", "webp"]:
-                                st.image(data)
-                        else:
-                            st.info("Preview unavailable for this file.")
-
-                        # Download button
-                        if data is not None:
-                            st.download_button(
-                                "Download",
-                                data=data,
-                                file_name=asset["name"].split("/")[-1],
-                                key=f"dl_{asset['name']}_{code}"
-                            )
-                        else:
-                            st.warning("Cannot download (no data loaded).")
-
+                        # Media logic
+                        if asset['ext'] in ['mp4', 'mov', 'webm']:
+                            st.video(asset['data'])
+                        elif asset['ext'] in ['mp3', 'wav']:
+                            st.audio(asset['data'])
+                        elif asset['ext'] in ['jpg', 'jpeg', 'png', 'gif']:
+                            st.image(asset['data'])
+                        
+                        st.download_button("Download", data=asset['data'], file_name=asset['name'], key=f"dl_{asset['name']}_{code}")
                         st.divider()
+
 else:
-    st.info("Please upload your Excel file and creative assets to begin.")
+    st.info("Please upload your Word doc and creative assets to begin.")
