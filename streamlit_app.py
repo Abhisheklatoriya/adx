@@ -1,53 +1,107 @@
-import streamlit as st
-import pandas as pd
-import zipfile
+# streamlit_app.py
+# ------------------------------------------------------------
+# Ad Creative Matcher (Excel/XLSX + live incremental ZIP/file processing)
+# - Reads an Excel report that has title rows ABOVE the real header row
+# - Auto-detects the header row containing "Ad Code"
+# - Extracts valid 8-digit ad codes from the sheet
+# - Processes uploaded ZIPs/files incrementally (disk-based, not RAM-based)
+# - Matches creatives by finding an 8-digit ad code inside the filename
+# - Writes matched files to disk under output/<ad_code>/...
+# - Shows matches immediately as they are processed
+# ------------------------------------------------------------
+
 import re
+import zipfile
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional, Set, List
+from typing import Optional, Set, List, Tuple
+
+import streamlit as st
+import pandas as pd
 
 # -------------------------------
 # App Config
 # -------------------------------
 st.set_page_config(page_title="Ad Creative Matcher", layout="wide")
-st.title("⚡ Ad Matcher (Excel + Live Processing + Disk Storage)")
+st.title("⚡ Ad Creative Matcher (Excel + Live Processing)")
 
 # -------------------------------
-# Excel loader
+# Constants / Regex
+# -------------------------------
+CODE_RE = re.compile(r"\b(\d{8})\b", flags=re.IGNORECASE)
+
+# -------------------------------
+# Workspace helpers (disk-based)
+# -------------------------------
+def ensure_workspace() -> Path:
+    """
+    Create a per-session temp workspace on disk.
+    """
+    if "workspace_dir" not in st.session_state:
+        st.session_state.workspace_dir = tempfile.mkdtemp(prefix="admatcher_")
+    return Path(st.session_state.workspace_dir)
+
+def output_dir() -> Path:
+    """
+    Root output folder where matched assets are written.
+    """
+    out = ensure_workspace() / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+def reset_workspace() -> None:
+    """
+    Clears workspace and processing state.
+    """
+    if "workspace_dir" in st.session_state:
+        shutil.rmtree(st.session_state.workspace_dir, ignore_errors=True)
+        del st.session_state["workspace_dir"]
+
+    for k in ["processed_keys"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+    st.cache_data.clear()
+
+# -------------------------------
+# Excel loader (auto header-row detection)
 # -------------------------------
 @st.cache_data
-import pandas as pd
-import streamlit as st
+def load_excel_auto_header(excel_file) -> Tuple[pd.DataFrame, str, List[str], Set[str]]:
+    """
+    Loads an Excel sheet that has title rows above the real header row.
+    Auto-detects the header row by scanning for a cell that contains 'Ad Code'.
 
-@st.cache_data
-def load_excel(file):
-    # 1) Read raw (no header) so we can find the real header row
-    raw = pd.read_excel(file, header=None, engine="openpyxl")
+    Returns:
+      df: cleaned dataframe
+      ad_code_col: detected column name containing ad code
+      ad_codes: list of 8-digit ad codes
+      ad_codes_set: set of 8-digit ad codes
+    """
+    # Read without headers so we can find where the header actually starts
+    raw = pd.read_excel(excel_file, header=None, engine="openpyxl")
 
-    # 2) Find the row that contains "Ad Code" (case-insensitive)
     header_row = None
-    for i in range(min(50, len(raw))):
+    scan_rows = min(80, len(raw))  # scan first 80 rows (safe for title-heavy sheets)
+
+    for i in range(scan_rows):
         row_vals = raw.iloc[i].astype(str).str.strip().str.lower()
-        if row_vals.eq("ad code").any() or row_vals.str.contains(r"\bad\s*code\b", regex=True).any():
+        # match cells like "Ad Code" or "Ad  Code"
+        if row_vals.str.contains(r"\bad\s*code\b", regex=True).any():
             header_row = i
             break
 
     if header_row is None:
-        # Helpful debug: show what the first rows look like
-        raise ValueError(
-            "Could not find the table header row containing 'Ad Code'. "
-            "Try increasing the scan range or confirm the sheet format."
-        )
+        raise ValueError("Could not find a header row containing 'Ad Code' in the first 80 rows.")
 
-    # 3) Re-read using the detected header row
-    df = pd.read_excel(file, header=header_row, engine="openpyxl")
+    # Re-read using the detected header row
+    df = pd.read_excel(excel_file, header=header_row, engine="openpyxl")
 
-    # 4) Normalize column names
+    # Normalize column names (keep originals but strip)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 5) Find Ad Code column robustly (handles 'Ad Code', 'AdCode', 'Ad  Code', etc.)
-    lower_cols = {c.lower(): c for c in df.columns}
+    # Find the Ad Code column robustly
     ad_code_col = None
     for c in df.columns:
         cl = c.lower().strip()
@@ -56,66 +110,83 @@ def load_excel(file):
             break
 
     if not ad_code_col:
-        raise ValueError(f"Found header row, but couldn't find Ad Code column. Columns seen: {list(df.columns)}")
+        raise ValueError(f"Found header row, but could not find an 'Ad Code' column. Columns: {list(df.columns)}")
 
-    # 6) Clean & keep only 8-digit codes
+    # Clean ad codes: keep only 8-digit numeric strings
     df[ad_code_col] = df[ad_code_col].astype(str).str.strip()
     df = df[df[ad_code_col].str.match(r"^\d{8}$")]
 
-    return df, ad_code_col
+    ad_codes = df[ad_code_col].tolist()
+    ad_codes_set = set(ad_codes)
 
-
-# -------------------------------
-# Disk workspace (per session)
-# -------------------------------
-def ensure_workspace() -> Path:
-    if "workspace_dir" not in st.session_state:
-        st.session_state.workspace_dir = tempfile.mkdtemp(prefix="admatcher_")
-    return Path(st.session_state.workspace_dir)
-
-def get_output_dir() -> Path:
-    base = ensure_workspace()
-    out = base / "output"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+    return df, ad_code_col, ad_codes, ad_codes_set
 
 # -------------------------------
-# Helpers
+# Matching helpers
 # -------------------------------
-CODE_RE = re.compile(r"\b(\d{8})\b")
-
-def extract_code_from_name(name: str, valid_codes_set: Set[str]) -> Optional[str]:
-    for m in CODE_RE.findall(name):
-        if m in valid_codes_set:
-            return m
-    return None
-
-def safe_filename(p: str) -> str:
+def safe_relpath(p: str) -> str:
+    """
+    Normalize paths inside zips (avoid absolute paths, Windows slashes).
+    """
     p = p.replace("\\", "/")
     p = p.lstrip("/").lstrip("./")
     return p
 
-def copy_stream_to_disk(src_fileobj, dest_path: Path):
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest_path, "wb") as out:
-        shutil.copyfileobj(src_fileobj, out, length=1024 * 1024)  # 1MB chunks
+def extract_ad_code_from_filename(name: str, valid_codes: Set[str]) -> Optional[str]:
+    """
+    Find any 8-digit number in filename and return it if it exists in valid_codes.
+    """
+    for m in CODE_RE.findall(name):
+        if m in valid_codes:
+            return m
+    return None
+
+def copy_stream_to_disk(src, dest: Path) -> None:
+    """
+    Copy a file-like object to disk in chunks (memory-safe).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(src, out, length=1024 * 1024)  # 1MB chunks
+
+def list_matches_for_code(code: str) -> List[Path]:
+    """
+    List all matched files written for a given ad code.
+    """
+    base = output_dir() / code
+    if not base.exists():
+        return []
+    return sorted([p for p in base.rglob("*") if p.is_file()])
+
+def file_ext(p: Path) -> str:
+    return p.suffix.lower().lstrip(".")
+
+def read_preview_bytes(p: Path, max_mb: int = 25) -> Optional[bytes]:
+    """
+    For previews, avoid loading huge files. Only read up to max_mb.
+    """
+    if p.stat().st_size > max_mb * 1024 * 1024:
+        return None
+    return p.read_bytes()
 
 # -------------------------------
-# Incremental processing
+# Incremental processing (runs each rerun; processes only new files)
 # -------------------------------
-def process_new_uploads(uploaded_files, valid_codes_set: Set[str]) -> None:
+def process_new_uploads(uploaded_files, valid_codes: Set[str]) -> None:
+    """
+    Process uploaded files/ZIPs and write matched items to disk immediately.
+    Uses session_state to avoid reprocessing already-seen uploads.
+    """
     if "processed_keys" not in st.session_state:
         st.session_state.processed_keys = set()
 
-    out_dir = get_output_dir()
-
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    # Rough steps: files + zip entries
+    # Estimate total steps for progress bar
     steps = 0
+    file_keys = []
+
     for uf in uploaded_files:
         key = f"{uf.name}|{getattr(uf, 'size', 'na')}"
+        file_keys.append((uf, key))
         if key in st.session_state.processed_keys:
             continue
 
@@ -123,83 +194,81 @@ def process_new_uploads(uploaded_files, valid_codes_set: Set[str]) -> None:
             try:
                 uf.seek(0)
                 with zipfile.ZipFile(uf) as z:
-                    entries = [i for i in z.infolist() if (not i.is_dir()) and "__MACOSX" not in i.filename]
-                    steps += max(len(entries), 1)
+                    entries = [
+                        i for i in z.infolist()
+                        if (not i.is_dir()) and "__MACOSX" not in i.filename
+                    ]
+                steps += max(len(entries), 1)
             except Exception:
                 steps += 1
         else:
             steps += 1
 
     if steps == 0:
-        status.write("No new files to process.")
+        st.info("No new uploads to process.")
         return
 
-    done = 0
+    progress = st.progress(0.0)
+    status = st.empty()
 
-    for uf in uploaded_files:
-        key = f"{uf.name}|{getattr(uf, 'size', 'na')}"
+    done = 0
+    out_root = output_dir()
+
+    for uf, key in file_keys:
         if key in st.session_state.processed_keys:
             continue
 
         status.write(f"Processing **{uf.name}** …")
 
+        # ZIP handling
         if uf.name.lower().endswith(".zip"):
             try:
                 uf.seek(0)
                 with zipfile.ZipFile(uf) as z:
-                    entries = [i for i in z.infolist() if (not i.is_dir()) and "__MACOSX" not in i.filename]
+                    entries = [
+                        i for i in z.infolist()
+                        if (not i.is_dir()) and "__MACOSX" not in i.filename
+                    ]
+
                     if not entries:
                         done += 1
                         progress.progress(min(done / steps, 1.0))
                     else:
                         for info in entries:
-                            fname = safe_filename(info.filename)
-                            code = extract_code_from_name(fname, valid_codes_set)
+                            inner_name = safe_relpath(info.filename)
+                            code = extract_ad_code_from_filename(inner_name, valid_codes)
 
                             if code:
-                                dest = out_dir / code / fname
+                                dest = out_root / code / inner_name
                                 with z.open(info) as src:
                                     copy_stream_to_disk(src, dest)
 
                             done += 1
                             progress.progress(min(done / steps, 1.0))
+
             except Exception as e:
                 st.warning(f"Could not read ZIP {uf.name}: {e}")
                 done += 1
                 progress.progress(min(done / steps, 1.0))
 
+        # Regular file handling
         else:
-            fname = safe_filename(uf.name)
-            code = extract_code_from_name(fname, valid_codes_set)
+            fname = safe_relpath(uf.name)
+            code = extract_ad_code_from_filename(fname, valid_codes)
             if code:
-                dest = out_dir / code / fname
+                dest = out_root / code / fname
                 try:
                     uf.seek(0)
                     copy_stream_to_disk(uf, dest)
                 except Exception as e:
-                    st.warning(f"Could not save file {uf.name}: {e}")
+                    st.warning(f"Could not save {uf.name}: {e}")
 
             done += 1
             progress.progress(min(done / steps, 1.0))
 
         st.session_state.processed_keys.add(key)
 
-    status.write("✅ Done processing currently uploaded files.")
-
-def list_matches_for_code(code: str) -> List[Path]:
-    out_dir = get_output_dir() / code
-    if not out_dir.exists():
-        return []
-    return sorted([p for p in out_dir.rglob("*") if p.is_file()])
-
-def ext_of(path: Path) -> str:
-    return path.suffix.lower().lstrip(".")
-
-def read_small_preview(path: Path, max_mb: int = 25) -> Optional[bytes]:
-    max_bytes = max_mb * 1024 * 1024
-    if path.stat().st_size > max_bytes:
-        return None
-    return path.read_bytes()
+    status.write("✅ Finished processing currently uploaded files.")
 
 # -------------------------------
 # Sidebar
@@ -207,48 +276,46 @@ def read_small_preview(path: Path, max_mb: int = 25) -> Optional[bytes]:
 with st.sidebar:
     st.header("Upload")
     excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-    raw_files = st.file_uploader("Upload Assets or ZIPs", accept_multiple_files=True)
+    assets_files = st.file_uploader("Upload Assets or ZIPs", accept_multiple_files=True)
 
-    if st.button("Reset session"):
-        if "workspace_dir" in st.session_state:
-            shutil.rmtree(st.session_state.workspace_dir, ignore_errors=True)
-        for k in ["workspace_dir", "processed_keys"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.cache_data.clear()
+    st.divider()
+    if st.button("Reset / Clear Session"):
+        reset_workspace()
         st.rerun()
 
 # -------------------------------
 # Main
 # -------------------------------
 if not excel_file:
-    st.info("Upload your Excel ad list to begin.")
+    st.info("Upload the Excel ad list to begin.")
     st.stop()
 
 try:
-    df, ad_code_col, ad_codes, ad_codes_set = load_excel(excel_file)
+    df, ad_code_col, ad_codes, ad_codes_set = load_excel_auto_header(excel_file)
 except Exception as e:
     st.error(f"Excel load error: {e}")
     st.stop()
 
-st.success(f"Ads in Excel: **{len(df)}**")
+st.success(f"Loaded **{len(df)}** ads from Excel. Detected ad code column: **{ad_code_col}**")
 
-if raw_files:
-    process_new_uploads(raw_files, ad_codes_set)
+if assets_files:
+    process_new_uploads(assets_files, ad_codes_set)
 else:
     st.info("Upload creatives/ZIPs — matches will appear as soon as files are processed.")
 
-search = st.text_input("🔍 Search Ad Code", placeholder="Type partial or full 8-digit code…")
+# Search + filters
+search = st.text_input("🔍 Search Ad Code", placeholder="Type partial or full 8-digit ad code…")
 filtered_codes = [c for c in ad_codes if search in c] if search else ad_codes
 
 only_matched = st.checkbox("Show only ad codes with matches", value=True)
 
+# Display results
 for code in filtered_codes:
-    files = list_matches_for_code(code)
-    if only_matched and not files:
+    matches = list_matches_for_code(code)
+    if only_matched and not matches:
         continue
 
-    with st.expander(f"{'✅' if files else '⚪️'} Ad {code} — {len(files)} files", expanded=bool(files)):
+    with st.expander(f"{'✅' if matches else '⚪️'} Ad {code} — {len(matches)} files", expanded=bool(matches)):
         c1, c2 = st.columns([1, 1.6])
 
         with c1:
@@ -256,29 +323,32 @@ for code in filtered_codes:
             st.dataframe(df[df[ad_code_col] == code], use_container_width=True)
 
         with c2:
-            if not files:
+            if not matches:
                 st.caption("No matching files yet. Upload more ZIPs/files…")
             else:
-                for p in files:
-                    st.caption(str(p.relative_to(get_output_dir() / code)))
+                for p in matches:
+                    rel = p.relative_to(output_dir() / code)
+                    st.caption(str(rel))
 
-                    preview_bytes = read_small_preview(p, max_mb=25)
-                    ext = ext_of(p)
+                    ext = file_ext(p)
+                    preview = read_preview_bytes(p, max_mb=25)
 
-                    if preview_bytes is None:
+                    if preview is None:
                         st.info("Preview skipped (file is large). Download to view.")
                     else:
                         if ext in ["mp4", "mov", "webm"]:
-                            st.video(preview_bytes)
+                            st.video(preview)
                         elif ext in ["mp3", "wav"]:
-                            st.audio(preview_bytes)
+                            st.audio(preview)
                         elif ext in ["jpg", "jpeg", "png", "gif"]:
-                            st.image(preview_bytes)
+                            st.image(preview)
 
+                    # Download (note: reads bytes; okay for typical creatives.
+                    # If you have very large files, we can add a "no-preview, no-read" download strategy.)
                     st.download_button(
                         "Download",
-                        data=p.read_bytes(),  # note: for very large files, we can optimize this next
+                        data=p.read_bytes(),
                         file_name=p.name,
-                        key=f"dl_{code}_{p.as_posix()}"
+                        key=f"dl_{code}_{p.as_posix()}",
                     )
                     st.divider()
