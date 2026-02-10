@@ -172,4 +172,47 @@ if xlsx_file and raw_files:
 
         if matches:
             with st.expander(f"✅ Ad {code} - {len(matches)} files found", expanded=True):
-                c1, c2 = st.columns(
+                c1, c2 = st.columns([1, 1.5])
+
+                # LEFT: Ad Specs (from XLSX)
+                with c1:
+                    st.markdown("**Ad Specs:**")
+                    row = df[df[ad_code_col] == code]
+                    if len(row) == 0:
+                        st.info("No row found in Excel for this Ad Code.")
+                    else:
+                        # show full row(s)
+                        st.dataframe(row, use_container_width=True)
+
+                # RIGHT: Creative previews + downloads
+                with c2:
+                    for asset in matches:
+                        st.caption(f"File: {asset['name']}")
+
+                        data = asset_bytes(asset)  # on-demand if safe_mode zip_ref
+
+                        # Preview logic
+                        if data is not None:
+                            if asset["ext"] in ["mp4", "mov", "webm"]:
+                                st.video(data)
+                            elif asset["ext"] in ["mp3", "wav"]:
+                                st.audio(data)
+                            elif asset["ext"] in ["jpg", "jpeg", "png", "gif", "webp"]:
+                                st.image(data)
+                        else:
+                            st.info("Preview unavailable for this file.")
+
+                        # Download button
+                        if data is not None:
+                            st.download_button(
+                                "Download",
+                                data=data,
+                                file_name=asset["name"].split("/")[-1],
+                                key=f"dl_{asset['name']}_{code}"
+                            )
+                        else:
+                            st.warning("Cannot download (no data loaded).")
+
+                        st.divider()
+else:
+    st.info("Please upload your Excel file and creative assets to begin.")
