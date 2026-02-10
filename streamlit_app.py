@@ -18,7 +18,7 @@ st.title("⚡ Ad Matcher (Excel + Live Processing + Disk Storage)")
 # -------------------------------
 @st.cache_data
 def load_excel(file):
-    df = pd.read_excel(file)
+    df = pd.read_excel(file, engine="openpyxl")
     df.columns = [c.strip().lower() for c in df.columns]
 
     ad_code_col = next((c for c in df.columns if "ad" in c and "code" in c), None)
